@@ -1,0 +1,4 @@
+# Generated during audit execution
+.venv/
+artifacts/
+results/
