@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This security audit of the Warp terminal application identified **9 Critical** and **14 High** severity vulnerabilities across authentication, encryption, IPC, AI integration, remote server, auto-update, and supply-chain components. Additionally, **4 vulnerability chains** demonstrate how individual findings combine into critical end-to-end attack scenarios with live evidence. The most severe findings allow:
+This security audit of the Warp terminal application identified **9 Critical** and **14 High** severity vulnerabilities across authentication, encryption, IPC, AI integration, remote server, auto-update, and supply-chain components. Additionally, **5 vulnerability chains** demonstrate how individual findings combine into critical end-to-end attack scenarios with live evidence. The most severe findings allow:
 
 1. **Offline decryption of all stored credentials** via static encryption key
 2. **Unauthenticated arbitrary file write/delete** on remote server daemon
@@ -21,6 +21,7 @@ This security audit of the Warp terminal application identified **9 Critical** a
 7. **RCE via malicious repository** through MCP working_directory injection
 8. **Code execution via supply-chain** through unsigned tmux installer and LD_LIBRARY_PATH
 9. **Remote server persistent compromise** via SSH command injection chained with daemon auth bypass
+10. **Zero-click cloud credential theft** via MCP auto-load chained with SSRF to EC2 instance metadata
 
 All vulnerabilities have been verified against source code at the audited commit. Proof-of-concept verification scripts are provided in the `exploits/` directory.
 
@@ -878,6 +879,45 @@ The following chains demonstrate how individual vulnerabilities combine into cri
 - `evidence/chain004_inject.log` — Proves command injection executed
 - `evidence/chain004_authorized_keys` — Proves WriteFile bypassed auth
 - `evidence/chain004_proof.json` — Structured JSON with `CHAIN004_PROOF_CONFIRMED`
+
+---
+
+### CHAIN-005: SSRF to Cloud Credential Theft via MCP Auto-Load
+
+| Contributing Vulnerabilities | Combined Severity |
+|------------------------------|-------------------|
+| VULN-023 (MCP Auto-Load without Approval) + VULN-030 (SSRF No URL Validation) | CRITICAL |
+
+**Attack Flow:**
+1. Attacker commits `.mcp.json` to a public repository with SSE server URL pointing to `http://169.254.169.254/` (or attacker-controlled server)
+2. Victim clones repository and opens directory in Warp
+3. **VULN-023:** Warp auto-loads `.mcp.json` from the current working directory with no user approval prompt
+4. MCP SSE client calls `send_initialize_request()` with the attacker-supplied URL
+5. **VULN-030:** HTTP POST is made directly to the attacker URL — `build_client_with_headers(headers)?.post(url)` — no scheme or host validation
+6. On cloud-hosted Warp instances, the request reaches `http://169.254.169.254/latest/meta-data/iam/security-credentials/`
+7. AWS IAM credentials (`AccessKeyId`, `SecretAccessKey`, `SessionToken`) returned and captured
+
+**Source Evidence:**
+- `mcp/mod.rs:195, native.rs:1768`: MCP config loaded from disk without user approval gate
+- `native.rs:2055-2090`: `build_client_with_headers(headers)?.post(url).json(&request).send()` — no URL validation
+
+**Impact:** Zero-click cloud account takeover — opening a cloned repository in Warp on any cloud-hosted instance (AWS EC2, GCP Compute, Azure VM) silently exfiltrates IAM credentials.
+
+**Why CHAIN-005 is worse than either vulnerability alone:**
+- VULN-030 alone requires the user to manually configure an MCP server URL
+- VULN-023 alone requires the user to interact with the MCP tooling
+- Combined: Opening a cloned repository in Warp triggers credential theft with zero additional user interaction
+
+**Remediation:**
+1. Require explicit user approval before loading `.mcp.json` from a newly opened directory (fixes VULN-023)
+2. Validate MCP SSE server URL scheme (HTTPS only) and block private IP ranges / link-local addresses (fixes VULN-030)
+
+**Live Demo Evidence:**
+- `evidence/chain005_mcp_config.json` — Malicious `.mcp.json` with attacker-controlled SSE URL
+- `evidence/chain005_request.log` — Exact HTTP POST Warp would send to the metadata endpoint
+- `evidence/chain005_response.log` — Mock server response with fake IAM credentials
+- `evidence/chain005_stolen_creds.json` — Stolen credentials with `CHAIN005_SESSION_TOKEN_DEMO`
+- `evidence/chain005_proof.json` — Structured JSON with `CHAIN005_PROOF_CONFIRMED`
 
 ---
 
