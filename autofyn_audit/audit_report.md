@@ -10,13 +10,16 @@
 
 ## Executive Summary
 
-This security audit of the Warp terminal application identified **6 Critical** and **12 High** severity vulnerabilities across authentication, encryption, IPC, AI integration, and remote server components. The most severe findings allow:
+This security audit of the Warp terminal application identified **8 Critical** and **12 High** severity vulnerabilities across authentication, encryption, IPC, AI integration, remote server, auto-update, and supply-chain components. The most severe findings allow:
 
 1. **Offline decryption of all stored credentials** via static encryption key
 2. **Unauthenticated arbitrary file write/delete** on remote server daemon
 3. **Command injection** via SSH session handling
 4. **Denial of service** via IPC memory exhaustion
 5. **Arbitrary code execution** via AI harness permission bypasses
+6. **Binary replacement** via unsigned Linux AppImage auto-update
+7. **RCE via malicious repository** through MCP working_directory injection
+8. **Code execution via supply-chain** through unsigned tmux installer and LD_LIBRARY_PATH
 
 All vulnerabilities have been verified against source code at the audited commit. Proof-of-concept verification scripts are provided in the `exploits/` directory.
 
@@ -303,6 +306,169 @@ Firebase custom token embedded in URL path, exposing it in browser history, serv
 | **CWE** | CWE-532: Information Exposure Through Log Files |
 
 `FirebaseAuthTokens`, `Credentials`, and `ApiKeys` derive `Debug` without redaction. Tokens appear in logs, error messages, Sentry breadcrumbs.
+
+---
+
+### VULN-022: Linux AppImage Auto-Update Without Integrity Verification
+
+| Attribute | Value |
+|-----------|-------|
+| **Severity** | CRITICAL |
+| **CVSS 3.1** | 9.0 (Critical) |
+| **File** | `app/src/autoupdate/linux.rs:80-143` |
+| **CWE** | CWE-494: Download of Code Without Integrity Check |
+
+**Description:**
+Warp's Linux auto-updater downloads a new AppImage from the release CDN using `client.get(&url).send()` and writes the response bytes directly to a tempfile. The tempfile is then moved over the live AppImage binary with no hash or cryptographic signature verification at any point. In contrast, the macOS updater calls `verify_code_signature()` which invokes `/usr/bin/codesign` to verify the bundle's team identifier before installation.
+
+**Vulnerable Code:**
+```rust
+// linux.rs:103-111
+let response = client.get(&url).timeout(DOWNLOAD_TIMEOUT).send().await?.error_for_status()?;
+new_appimage.as_file_mut().write_all(&response.bytes().await?)?;
+// linux.rs:128-133  — no verify step between download and mv
+Command::new("mv").arg(new_appimage_path.as_os_str()).arg(appimage_path).output().await?;
+```
+
+**Contrast — mac.rs:312-334:**
+```rust
+async fn verify_code_signature(component: &str, path: &Path) -> Result<()> {
+    let codesign_verify_output = Command::new("/usr/bin/codesign")
+        .arg("-v")
+        .arg(format!("-R=certificate leaf[subject.OU] = \"{}\"", warp_core::macos::APPLE_TEAM_ID))
+        .arg(path).output().await?;
+    ensure!(codesign_verify_output.status.success(), ...);
+}
+```
+
+**Attack Scenario:**
+1. Attacker achieves MITM on path to releases.warp.dev CDN (rogue Wi-Fi, BGP hijack, compromised CDN edge)
+2. Warp constructs download URL from `release_assets_directory_url()` + `APPIMAGE_NAME`
+3. Attacker substitutes trojaned AppImage containing backdoor or credential stealer
+4. `linux.rs` writes attacker bytes to tempfile, sets permissions, runs `mv` over live binary
+5. Next Warp launch executes attacker binary — no checksum, no signature, no TOFU
+
+**Impact:** Silent full binary replacement. Attacker achieves persistent code execution as the user.
+
+**Remediation:** Download and verify a SHA-256 manifest (signed with Warp's GPG key) before moving the AppImage into place. Mirror the `verify_code_signature()` pattern from mac.rs using a platform-appropriate mechanism.
+
+---
+
+### VULN-023: MCP working_directory Path Traversal to RCE
+
+| Attribute | Value |
+|-----------|-------|
+| **Severity** | CRITICAL |
+| **CVSS 3.1** | 9.0 (Critical) |
+| **Files** | `app/src/ai/mcp/mod.rs:195,543-547`, `native.rs:1768-1769`, `file_mcp_watcher.rs:155-168` |
+| **CWE** | CWE-22: Path Traversal, CWE-426: Untrusted Search Path |
+
+**Description:**
+The MCP (Model Context Protocol) JSON config parser reads `working_directory` from `.mcp.json` as a raw `Option<String>` with no validation or canonicalization. The value is passed directly to `cmd.current_dir()` when spawning the MCP server process. The auto-load mechanism in `file_mcp_watcher.rs` triggers without user approval when the terminal navigates to a repository containing `.mcp.json`.
+
+**Vulnerable Code:**
+```rust
+// mod.rs:195
+working_directory: Option<String>,  // any string accepted from JSON
+
+// mod.rs:543-547
+cwd_parameter: working_directory.to_owned(),  // no validation
+
+// native.rs:1768-1769
+if let Some(cwd) = cli_server.cwd_parameter {
+    cmd.current_dir(cwd);  // raw user-controlled string
+}
+
+// file_mcp_watcher.rs:155-158
+if matches!(source, RepoDetectionSource::TerminalNavigation | ...) {
+    me.register_repo_for_file_mcp_watching(repo_path, ctx, ...);  // auto-load
+}
+```
+
+**Attack Scenario:**
+1. Attacker creates repo with `.mcp.json`: `{ "mcpServers": { "evil": { "command": "node", "working_directory": "/etc" } } }`
+2. Victim clones repo and navigates to it in the Warp terminal
+3. `file_mcp_watcher.rs` triggers on `TerminalNavigation` — auto-loads `.mcp.json` without prompt
+4. `mod.rs` stores `working_directory: "/etc"` in `cwd_parameter` with no checks
+5. `native.rs` calls `cmd.current_dir("/etc")` — interpreter spawns with cwd=/etc
+6. Node.js/Python load configs from cwd; attacker-controlled configs achieve RCE
+
+**Impact:** A single `cd` into a malicious repository triggers MCP server spawn with attacker-chosen working directory, enabling RCE through interpreter config loading.
+
+**Remediation:** Canonicalize `working_directory` and validate it is within the repository root. Require explicit user approval before spawning any MCP server from a newly discovered repository config file.
+
+---
+
+### VULN-024: Tmux Installer Unsigned Download + LD_LIBRARY_PATH Injection
+
+| Attribute | Value |
+|-----------|-------|
+| **Severity** | CRITICAL |
+| **CVSS 3.1** | 8.1 (High) |
+| **File** | `app/assets/bundled/ssh/bash_zsh/install_tmux_and_warpify_linux.sh:21-26` |
+| **CWE** | CWE-494: Download of Code Without Integrity Check, CWE-427: Uncontrolled Search Path Element |
+
+**Description:**
+The SSH warpification script downloads a tmux binary from GitHub releases using `curl` or `wget` without verifying any checksum or GPG signature. After extraction, `execute_tmux.sh` is generated with `LD_LIBRARY_PATH` pointing to `$HOME/.warp/tmux/local/lib` — a user-writable directory. An attacker can pre-plant a malicious shared library in that path, which will be loaded by tmux on every subsequent invocation.
+
+**Vulnerable Code:**
+```bash
+# Line 21
+URL="https://github.com/warpdotdev/portable-tmux/releases/download/tmux-3.5a/tmux-${ARCH_NAME}.tar.gz"
+# Line 23 — no sha256sum/gpg step
+(curl -o tmux.tar.gz -L $URL || wget -O tmux.tar.gz $URL) && tar -xf tmux.tar.gz
+# Line 26 — user-writable LD_LIBRARY_PATH
+echo "TERM=tmux-256color LD_LIBRARY_PATH=\"$INSTALL_PATH/lib\" ... \"$INSTALL_PATH/bin/tmux\" \"$@\";" > execute_tmux.sh
+```
+
+**Attack Scenario:**
+- *Vector 1 — LD_LIBRARY_PATH preload:* Attacker writes malicious `.so` to `~/.warp/tmux/local/lib/` before installation. `execute_tmux.sh` sets `LD_LIBRARY_PATH` to that path; any `.so` is loaded into the tmux process.
+- *Vector 2 — MITM download:* Attacker intercepts `curl`/`wget` to GitHub releases and returns a trojaned `tmux.tar.gz`. Script extracts without checksum verification. Malicious binary executes.
+
+**Impact:** Persistent code execution in tmux process on every SSH Warp session.
+
+**Remediation:** Download and verify a SHA-256 checksum file alongside the archive before extraction. Build tmux with `RUNPATH` or link statically to avoid `LD_LIBRARY_PATH` dependency.
+
+---
+
+## High Severity Findings
+
+### VULN-025: WARP_PATH_APPEND Environment Variable Injection
+
+| Attribute | Value |
+|-----------|-------|
+| **Severity** | HIGH |
+| **CVSS 3.1** | 7.8 (High) |
+| **Files** | `app/src/terminal/local_tty/unix.rs:334-337`, `bash_body.sh:1221-1222`, `zsh_body.sh:1089-1090`, `fish.sh:43-44` |
+| **CWE** | CWE-426: Untrusted Search Path |
+
+**Description:**
+`unix.rs` sets the `WARP_PATH_APPEND` environment variable from `extra_path_entries()` and passes it to every spawned shell process. The bootstrap scripts for bash, zsh, and fish append the value verbatim to `PATH` with no content validation. Because `unix.rs` does not clear the inherited environment value of `WARP_PATH_APPEND` before setting its own, a malicious parent process can pre-set `WARP_PATH_APPEND=/tmp/evil` and have it propagate into every Warp shell session.
+
+**Vulnerable Code:**
+```rust
+// unix.rs:334-337
+let path_append = extra_path_entries().map(|p| p.to_string_lossy().into_owned()).join(":");
+builder.env("WARP_PATH_APPEND", path_append);  // does not unset inherited value first
+```
+```bash
+# bash_body.sh:1221-1222
+if [[ ! -z "$WARP_PATH_APPEND" ]]; then
+    export PATH="$PATH:$WARP_PATH_APPEND"  # no sanitization
+    unset WARP_PATH_APPEND                 # unset AFTER PATH is already poisoned
+fi
+```
+
+**Attack Scenario:**
+1. Malicious parent process (IDE, CI runner, npm lifecycle script) sets `WARP_PATH_APPEND=/tmp/evil`
+2. User launches Warp from that parent environment; `WARP_PATH_APPEND` is inherited
+3. `bash_body.sh`/`zsh_body.sh`/`fish.sh` appends `/tmp/evil` to `PATH`
+4. Attacker has planted `/tmp/evil/git`, `/tmp/evil/npm`, `/tmp/evil/node`
+5. Every subsequent git/npm/node invocation executes attacker-controlled binaries
+
+**Impact:** PATH hijacking in all Warp shell sessions, enabling silent binary shadowing of common tools.
+
+**Remediation:** `unix.rs` should explicitly unset the inherited `WARP_PATH_APPEND` before setting its own value (`builder.env_remove("WARP_PATH_APPEND")` before `builder.env(...)`). The bootstrap scripts should also validate that `WARP_PATH_APPEND` contains only absolute paths with no suspicious characters.
 
 ---
 
