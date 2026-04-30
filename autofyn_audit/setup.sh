@@ -43,6 +43,9 @@ grep -rn "\-\-yolo" "$REPO_ROOT/app/src/ai/" >> "$AUDIT_DIR/artifacts/dangerous_
 echo "[4/4] Creating Python virtual environment for exploit scripts..."
 if command -v python3 &> /dev/null; then
     python3 -m venv "$AUDIT_DIR/.venv" 2>/dev/null || echo "venv creation skipped (may already exist or not needed)"
+    if [ -d "$AUDIT_DIR/.venv" ]; then
+        "$AUDIT_DIR/.venv/bin/pip" install --quiet cryptography requests 2>/dev/null || echo "pip install skipped (install manually: pip install cryptography requests)"
+    fi
 fi
 
 echo ""
